@@ -65,6 +65,14 @@ the events:
 When adding a new event case, mirror the existing pattern: extract `Info.ID`,
 `Info.Chat.String()`, `Info.Sender.User`, call `StoreChat` then `StoreMessage`.
 
+`extractTextContent` and `extractMediaInfo` must understand the common
+business-account payload types (`TemplateMessage`, `InteractiveMessage`,
+`ButtonsMessage`, `ListMessage`) and recursively unwrap the envelope types
+(`EphemeralMessage`, `ViewOnceMessage(V2/V2Extension)`, `DeviceSentMessage`).
+When `handleMessage` finds neither text nor media it logs the set protobuf
+field names — grep `bridge.out.log` for `proto fields set:` to discover new
+payload types and extend the extractors rather than adding new handlers.
+
 ## Running in background on Windows
 
 After completing the QR pairing once with `go run .`, use the scripts in

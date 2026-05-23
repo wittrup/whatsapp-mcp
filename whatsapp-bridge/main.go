@@ -30,6 +30,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // Message represents a chat message for our client
@@ -70,6 +71,14 @@ func (p *pendingUnavailable) signal(id string) {
 
 func (p *pendingUnavailable) clear(id string) {
 	p.m.Delete(id)
+}
+
+// has reports whether a placeholder is currently registered for this ID.
+// Used by handleMessage so a resent message that fails text/media extraction
+// still overwrites the placeholder with a sentinel instead of leaving it stale.
+func (p *pendingUnavailable) has(id string) bool {
+	_, ok := p.m.Load(id)
+	return ok
 }
 
 // Initialize message store
@@ -198,20 +207,86 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
-// Extract text content from a message
+// Extract text content from a message.
+//
+// Handles the common payload types and recursively unwraps the standard
+// wrapper messages (Ephemeral / ViewOnce / DeviceSent). Without this, WhatsApp
+// Business accounts (DHL, banks, OTP services) — which deliver text inside
+// TemplateMessage / InteractiveMessage / ButtonsMessage / ListMessage — would
+// fall through and be silently dropped by handleMessage's empty-content
+// early-return.
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
 	}
 
-	// Try to get text content
+	// Plain text
 	if text := msg.GetConversation(); text != "" {
 		return text
-	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
-		return extendedText.GetText()
+	}
+	if e := msg.GetExtendedTextMessage(); e != nil {
+		if text := e.GetText(); text != "" {
+			return text
+		}
 	}
 
-	// For now, we're ignoring non-text messages
+	// Business-account interactive payloads — text is buried a level or two deep.
+	if tpl := msg.GetTemplateMessage(); tpl != nil {
+		if h := tpl.GetHydratedTemplate(); h != nil {
+			if text := h.GetHydratedContentText(); text != "" {
+				return text
+			}
+			if text := h.GetHydratedTitleText(); text != "" {
+				return text
+			}
+		}
+	}
+	if im := msg.GetInteractiveMessage(); im != nil {
+		if b := im.GetBody(); b != nil {
+			if text := b.GetText(); text != "" {
+				return text
+			}
+		}
+	}
+	if b := msg.GetButtonsMessage(); b != nil {
+		if text := b.GetContentText(); text != "" {
+			return text
+		}
+	}
+	if l := msg.GetListMessage(); l != nil {
+		if text := l.GetDescription(); text != "" {
+			return text
+		}
+	}
+
+	// Wrappers — recurse on their inner Message so a Template (etc.) hiding
+	// inside an Ephemeral or ViewOnce envelope is still extracted.
+	if w := msg.GetEphemeralMessage(); w != nil {
+		if text := extractTextContent(w.GetMessage()); text != "" {
+			return text
+		}
+	}
+	if w := msg.GetViewOnceMessage(); w != nil {
+		if text := extractTextContent(w.GetMessage()); text != "" {
+			return text
+		}
+	}
+	if w := msg.GetViewOnceMessageV2(); w != nil {
+		if text := extractTextContent(w.GetMessage()); text != "" {
+			return text
+		}
+	}
+	if w := msg.GetViewOnceMessageV2Extension(); w != nil {
+		if text := extractTextContent(w.GetMessage()); text != "" {
+			return text
+		}
+	}
+	if w := msg.GetDeviceSentMessage(); w != nil {
+		if text := extractTextContent(w.GetMessage()); text != "" {
+			return text
+		}
+	}
+
 	return ""
 }
 
@@ -397,10 +472,40 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	return true, fmt.Sprintf("Message sent to %s", recipient)
 }
 
-// Extract media info from a message
+// Extract media info from a message. Mirrors extractTextContent's wrapper
+// unwrapping so media buried in an Ephemeral / ViewOnce / DeviceSent envelope
+// is still discovered.
 func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, url string, mediaKey []byte, fileSHA256 []byte, fileEncSHA256 []byte, fileLength uint64) {
 	if msg == nil {
 		return "", "", "", nil, nil, nil, 0
+	}
+
+	// Unwrap common envelope types first so the per-media checks below see
+	// the inner payload.
+	if w := msg.GetEphemeralMessage(); w != nil {
+		if t, f, u, k, s1, s2, l := extractMediaInfo(w.GetMessage()); t != "" {
+			return t, f, u, k, s1, s2, l
+		}
+	}
+	if w := msg.GetViewOnceMessage(); w != nil {
+		if t, f, u, k, s1, s2, l := extractMediaInfo(w.GetMessage()); t != "" {
+			return t, f, u, k, s1, s2, l
+		}
+	}
+	if w := msg.GetViewOnceMessageV2(); w != nil {
+		if t, f, u, k, s1, s2, l := extractMediaInfo(w.GetMessage()); t != "" {
+			return t, f, u, k, s1, s2, l
+		}
+	}
+	if w := msg.GetViewOnceMessageV2Extension(); w != nil {
+		if t, f, u, k, s1, s2, l := extractMediaInfo(w.GetMessage()); t != "" {
+			return t, f, u, k, s1, s2, l
+		}
+	}
+	if w := msg.GetDeviceSentMessage(); w != nil {
+		if t, f, u, k, s1, s2, l := extractMediaInfo(w.GetMessage()); t != "" {
+			return t, f, u, k, s1, s2, l
+		}
 	}
 
 	// Check for image message
@@ -434,8 +539,18 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	return "", "", "", nil, nil, nil, 0
 }
 
-// Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+// Sentinel content stored when an events.Message arrives for a previously
+// undecryptable ID but our extractor still can't find anything to surface.
+// Better than dropping the row — the user at least knows something arrived.
+const unsupportedContentSentinel = "[message received - content type not supported]"
+
+// Handle regular incoming messages with media support.
+//
+// `pending` is the placeholder registry from handleUndecryptableMessage; it is
+// consulted only when both extractors return nothing, so a resent message
+// whose content type we don't yet recognize still overwrites its placeholder
+// row with a sentinel instead of leaving it stale.
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pending *pendingUnavailable, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -455,9 +570,26 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)
 
-	// Skip if there's no content and no media
+	// If neither extractor produced anything, log which proto fields were
+	// set so we can extend the extractors for whatever payload this was.
+	// If a placeholder is registered for this ID, overwrite it with a
+	// sentinel rather than dropping the row.
 	if content == "" && mediaType == "" {
-		return
+		var fields []string
+		if msg.Message != nil {
+			msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+				fields = append(fields, string(fd.Name()))
+				return true
+			})
+		}
+		logger.Infof("No extractable content for %s in %s (sender=%s); proto fields set: %v",
+			msg.Info.ID, chatJID, sender, fields)
+
+		if pending != nil && pending.has(msg.Info.ID) {
+			content = unsupportedContentSentinel
+		} else {
+			return
+		}
 	}
 
 	// Store message in database
@@ -924,7 +1056,7 @@ func main() {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, pending, v, logger)
 			// If this is the resent counterpart of a previously-undecryptable
 			// message, wake the waiter so it logs success instead of timing out.
 			pending.signal(v.Info.ID)
