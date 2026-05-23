@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,6 +45,31 @@ type Message struct {
 // Database handler for storing message history
 type MessageStore struct {
 	db *sql.DB
+}
+
+// pendingUnavailable tracks message IDs we have stored as placeholders after an
+// UndecryptableMessage event. When the resend arrives via events.Message and is
+// stored by handleMessage (which uses INSERT OR REPLACE), signal() closes the
+// channel so the waiter logs success instead of timing out. Correctness of the
+// row update does not depend on this map — it exists solely for logging.
+type pendingUnavailable struct {
+	m sync.Map // map[string]chan struct{}
+}
+
+func (p *pendingUnavailable) register(id string) <-chan struct{} {
+	ch := make(chan struct{})
+	p.m.Store(id, ch)
+	return ch
+}
+
+func (p *pendingUnavailable) signal(id string) {
+	if v, ok := p.m.LoadAndDelete(id); ok {
+		close(v.(chan struct{}))
+	}
+}
+
+func (p *pendingUnavailable) clear(id string) {
+	p.m.Delete(id)
 }
 
 // Initialize message store
@@ -470,6 +496,61 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 }
 
+// Placeholder content written for undecryptable messages so the row is not lost
+// if the sender never honors the resend request.
+const undecryptablePlaceholder = "[message unavailable - resend requested]"
+
+// Handle UndecryptableMessage events by storing a placeholder row, so business
+// account messages (DHL, banks, OTP services) are not silently dropped when the
+// sender's primary device fails to respond to the library's automatic resend
+// request. If the resend later arrives, handleMessage overwrites the row via
+// INSERT OR REPLACE; the goroutine here only exists to log the outcome.
+func handleUndecryptableMessage(client *whatsmeow.Client, store *MessageStore,
+	pending *pendingUnavailable, evt *events.UndecryptableMessage, logger waLog.Logger) {
+
+	if !evt.IsUnavailable || evt.DecryptFailMode == events.DecryptFailHide || evt.Info.IsFromMe {
+		logger.Debugf("Skipping undecryptable %s (unavailable=%v mode=%q fromMe=%v)",
+			evt.Info.ID, evt.IsUnavailable, evt.DecryptFailMode, evt.Info.IsFromMe)
+		return
+	}
+
+	chatJID := evt.Info.Chat.String()
+	sender := evt.Info.Sender.User
+	name := GetChatName(client, store, evt.Info.Chat, chatJID, nil, sender, logger)
+
+	if err := store.StoreChat(chatJID, name, evt.Info.Timestamp); err != nil {
+		logger.Warnf("Failed to store chat for undecryptable %s: %v", evt.Info.ID, err)
+	}
+
+	// Register BEFORE storing so a fast resend cannot slip through unobserved.
+	ch := pending.register(evt.Info.ID)
+
+	err := store.StoreMessage(
+		evt.Info.ID, chatJID, sender,
+		undecryptablePlaceholder,
+		evt.Info.Timestamp, false,
+		"", "", "", nil, nil, nil, 0,
+	)
+	if err != nil {
+		logger.Warnf("Failed to store placeholder for %s: %v", evt.Info.ID, err)
+		pending.clear(evt.Info.ID)
+		return
+	}
+
+	logger.Infof("Stored placeholder for undecryptable %s from %s (type=%q); waiting up to 60s for resend",
+		evt.Info.ID, sender, evt.UnavailableType)
+
+	go func(id string) {
+		select {
+		case <-ch:
+			logger.Infof("Resend received for %s; placeholder overwritten", id)
+		case <-time.After(60 * time.Second):
+			pending.clear(id)
+			logger.Warnf("No resend within 60s for %s; placeholder retained", id)
+		}
+	}(evt.Info.ID)
+}
+
 // DownloadMediaRequest represents the request body for the download media API
 type DownloadMediaRequest struct {
 	MessageID string `json:"message_id"`
@@ -641,7 +722,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -800,14 +881,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -834,12 +915,25 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Tracks placeholders written for undecryptable messages so we can log when
+	// (or whether) the resend lands. See handleUndecryptableMessage.
+	pending := &pendingUnavailable{}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
+			// If this is the resent counterpart of a previously-undecryptable
+			// message, wake the waiter so it logs success instead of timing out.
+			pending.signal(v.Info.ID)
+
+		case *events.UndecryptableMessage:
+			// Persist a placeholder row so business-account messages are not
+			// silently dropped when the sender's primary device fails to honor
+			// whatsmeow's automatic resend request.
+			handleUndecryptableMessage(client, messageStore, pending, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
@@ -973,7 +1067,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1082,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
