@@ -207,6 +207,29 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// extractFromTemplateMessage tries every known way a TemplateMessage can
+// carry text. WhatsApp Business senders populate one of three Format oneof
+// variants — FourRowTemplate, HydratedFourRowTemplate, or
+// InteractiveMessageTemplate — or the standalone HydratedTemplate field.
+func extractFromTemplateMessage(tpl *waProto.TemplateMessage) string {
+	if tpl == nil {
+		return ""
+	}
+	if text := extractFromHydratedTemplate(tpl.GetHydratedTemplate()); text != "" {
+		return text
+	}
+	if text := extractFromHydratedTemplate(tpl.GetHydratedFourRowTemplate()); text != "" {
+		return text
+	}
+	if text := extractFromFourRowTemplate(tpl.GetFourRowTemplate()); text != "" {
+		return text
+	}
+	if text := extractFromInteractiveMessage(tpl.GetInteractiveMessageTemplate()); text != "" {
+		return text
+	}
+	return ""
+}
+
 // extractFromHydratedTemplate pulls text from a HydratedFourRowTemplate,
 // combining body + footer + URL-button URLs (newline-separated) so the full
 // message visible in WhatsApp — including tracking links — is preserved.
@@ -236,6 +259,98 @@ func extractFromHydratedTemplate(h *waProto.TemplateMessage_HydratedFourRowTempl
 	return strings.Join(parts, "\n")
 }
 
+// extractFromFourRowTemplate handles the non-hydrated FourRowTemplate variant.
+// Content/Footer are HighlyStructuredMessage; URL-button URLs are too.
+func extractFromFourRowTemplate(t *waProto.TemplateMessage_FourRowTemplate) string {
+	if t == nil {
+		return ""
+	}
+	var parts []string
+	if text := extractFromHighlyStructuredMessage(t.GetContent()); text != "" {
+		parts = append(parts, text)
+	}
+	if text := extractFromHighlyStructuredMessage(t.GetFooter()); text != "" {
+		parts = append(parts, text)
+	}
+	for _, btn := range t.GetButtons() {
+		if u := btn.GetUrlButton(); u != nil {
+			if url := extractFromHighlyStructuredMessage(u.GetURL()); url != "" {
+				parts = append(parts, url)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// extractFromHighlyStructuredMessage walks an HSM: either it wraps a
+// hydrated TemplateMessage (HydratedHsm) or it carries substituted Params.
+func extractFromHighlyStructuredMessage(h *waProto.HighlyStructuredMessage) string {
+	if h == nil {
+		return ""
+	}
+	if text := extractFromTemplateMessage(h.GetHydratedHsm()); text != "" {
+		return text
+	}
+	if params := h.GetParams(); len(params) > 0 {
+		return strings.Join(params, " ")
+	}
+	return ""
+}
+
+// extractFromInteractiveMessage pulls every text-bearing field out of an
+// InteractiveMessage: Header (Title + Subtitle), Body, Footer, and the URLs
+// embedded as JSON in NativeFlowMessage button params.
+func extractFromInteractiveMessage(im *waProto.InteractiveMessage) string {
+	if im == nil {
+		return ""
+	}
+	var parts []string
+	if h := im.GetHeader(); h != nil {
+		if text := h.GetTitle(); text != "" {
+			parts = append(parts, text)
+		}
+		if text := h.GetSubtitle(); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	if b := im.GetBody(); b != nil {
+		if text := b.GetText(); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	if f := im.GetFooter(); f != nil {
+		if text := f.GetText(); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	if nf := im.GetNativeFlowMessage(); nf != nil {
+		for _, btn := range nf.GetButtons() {
+			if url := extractURLFromButtonParamsJSON(btn.GetButtonParamsJSON()); url != "" {
+				parts = append(parts, url)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// extractURLFromButtonParamsJSON pulls a URL out of a NativeFlow button's
+// JSON parameters. Common shape: {"display_text":"…","url":"…"}.
+func extractURLFromButtonParamsJSON(s string) string {
+	if s == "" {
+		return ""
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+		return ""
+	}
+	for _, key := range []string{"url", "link", "cta_url"} {
+		if v, ok := parsed[key].(string); ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 // Extract text content from a message.
 //
 // Handles the common payload types and recursively unwraps the standard
@@ -260,25 +375,11 @@ func extractTextContent(msg *waProto.Message) string {
 	}
 
 	// Business-account interactive payloads — text is buried a level or two deep.
-	if tpl := msg.GetTemplateMessage(); tpl != nil {
-		// TemplateMessage carries hydrated content in two distinct places:
-		//   - HydratedTemplate: direct proto field 4 (some senders)
-		//   - Format oneof as HydratedFourRowTemplate_ (DHL and others)
-		// Both must be tried; whichever is non-nil holds the real content.
-		if text := extractFromHydratedTemplate(tpl.GetHydratedTemplate()); text != "" {
-			return text
-		}
-		if text := extractFromHydratedTemplate(tpl.GetHydratedFourRowTemplate()); text != "" {
-			return text
-		}
-		// InteractiveMessageTemplate falls through to the GetInteractiveMessage() check below.
+	if text := extractFromTemplateMessage(msg.GetTemplateMessage()); text != "" {
+		return text
 	}
-	if im := msg.GetInteractiveMessage(); im != nil {
-		if b := im.GetBody(); b != nil {
-			if text := b.GetText(); text != "" {
-				return text
-			}
-		}
+	if text := extractFromInteractiveMessage(msg.GetInteractiveMessage()); text != "" {
+		return text
 	}
 	if b := msg.GetButtonsMessage(); b != nil {
 		if text := b.GetContentText(); text != "" {
@@ -609,8 +710,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, pending
 	if content == "" && mediaType == "" {
 		var fields []string
 		if msg.Message != nil {
-			msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
-				fields = append(fields, string(fd.Name()))
+			msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+				name := string(fd.Name())
+				fields = append(fields, name)
+				// For known interactive envelopes, dump one level deeper so the
+				// next unknown variant is diagnosable without another fix cycle.
+				switch name {
+				case "templateMessage", "interactiveMessage", "buttonsMessage", "listMessage":
+					if fd.Kind() == protoreflect.MessageKind {
+						v.Message().Range(func(fd2 protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+							fields = append(fields, name+"."+string(fd2.Name()))
+							return true
+						})
+					}
+				}
 				return true
 			})
 		}
