@@ -207,6 +207,35 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 	return chats, nil
 }
 
+// extractFromHydratedTemplate pulls text from a HydratedFourRowTemplate,
+// combining body + footer + URL-button URLs (newline-separated) so the full
+// message visible in WhatsApp — including tracking links — is preserved.
+func extractFromHydratedTemplate(h *waProto.TemplateMessage_HydratedFourRowTemplate) string {
+	if h == nil {
+		return ""
+	}
+	var parts []string
+	if text := h.GetHydratedContentText(); text != "" {
+		parts = append(parts, text)
+	}
+	if len(parts) == 0 {
+		if text := h.GetHydratedTitleText(); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	if text := h.GetHydratedFooterText(); text != "" {
+		parts = append(parts, text)
+	}
+	for _, btn := range h.GetHydratedButtons() {
+		if u := btn.GetUrlButton(); u != nil {
+			if url := u.GetURL(); url != "" {
+				parts = append(parts, url)
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
 // Extract text content from a message.
 //
 // Handles the common payload types and recursively unwraps the standard
@@ -232,14 +261,17 @@ func extractTextContent(msg *waProto.Message) string {
 
 	// Business-account interactive payloads — text is buried a level or two deep.
 	if tpl := msg.GetTemplateMessage(); tpl != nil {
-		if h := tpl.GetHydratedTemplate(); h != nil {
-			if text := h.GetHydratedContentText(); text != "" {
-				return text
-			}
-			if text := h.GetHydratedTitleText(); text != "" {
-				return text
-			}
+		// TemplateMessage carries hydrated content in two distinct places:
+		//   - HydratedTemplate: direct proto field 4 (some senders)
+		//   - Format oneof as HydratedFourRowTemplate_ (DHL and others)
+		// Both must be tried; whichever is non-nil holds the real content.
+		if text := extractFromHydratedTemplate(tpl.GetHydratedTemplate()); text != "" {
+			return text
 		}
+		if text := extractFromHydratedTemplate(tpl.GetHydratedFourRowTemplate()); text != "" {
+			return text
+		}
+		// InteractiveMessageTemplate falls through to the GetInteractiveMessage() check below.
 	}
 	if im := msg.GetInteractiveMessage(); im != nil {
 		if b := im.GetBody(); b != nil {
